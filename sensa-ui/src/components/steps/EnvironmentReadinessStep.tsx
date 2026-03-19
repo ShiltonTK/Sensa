@@ -16,6 +16,11 @@ const CHECKLIST_ITEMS = [
     id: 'visibility',
     title: 'Sensor Visibility',
     description: 'All sensors are accessible and visible for calibration'
+  },
+  {
+    id: 'cleaning', // <--- NEW ITEM
+    title: 'Clean and wipe biometric sensors',
+    description: 'All sensors to be used should be wiped with an alcohol swab to ensure easy calibration.'
   }
 ];
 

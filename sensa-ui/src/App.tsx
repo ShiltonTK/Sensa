@@ -91,7 +91,7 @@ export default function App() {
 
       {currentStep === 7 && (
         <div className="py-10 text-center text-gray-500">
-          <h2>Step 7 Phase (Coming Next!)</h2>
+          <h2>Step 7 Phase (In Progress)</h2>
         </div>
       )}
     </SetupLayout>

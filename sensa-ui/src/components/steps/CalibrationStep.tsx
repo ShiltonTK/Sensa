@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Eye, Activity, Heart, Brain, AlertCircle, CheckCircle2 } from 'lucide-react';
+import EEGCalibrationFlow from './EEGCalibrationFlow';
 
 const SENSORS = [
   { id: 'eye', name: 'Eye Tracker', device: 'Tobii Eye Tracker 4C', icon: Eye },
@@ -15,42 +16,35 @@ export default function CalibrationStep({
   onContinue: () => void;
   onUpdateHeader: (header: { title: string, subtitle: string } | null) => void;
 }) {
-  // Track which sensors have been calibrated
   const [calibratedSensors, setCalibratedSensors] = useState<string[]>([]);
-  
-  // Track if we are currently inside a specific sensor's calibration screen
   const [activeSensorId, setActiveSensorId] = useState<string | null>(null);
-  
-  // Track the internal state of the active calibration (plugged in vs active)
   const [calibrationPhase, setCalibrationPhase] = useState<'empty' | 'active'>('empty');
 
-  // When activeSensorId changes, tell App.tsx to update the main Layout title
   useEffect(() => {
     if (activeSensorId) {
       const sensor = SENSORS.find(s => s.id === activeSensorId);
-      onUpdateHeader({
-        title: `${sensor?.name} calibration`,
-        subtitle: `Follow the onscreen instructions to properly calibrate the ${sensor?.device}`
-      });
+      // Hides the global subtitle if in the EEG flow, EEG component brings own header
+      if (activeSensorId === 'eeg') {
+        onUpdateHeader({ title: "EEG Calibration", subtitle: "Follow the onscreen instructions to properly calibrate the Biosignalsplux EEG Sensor" });
+      } else {
+        onUpdateHeader({ title: `${sensor?.name} calibration`, subtitle: `Follow the onscreen instructions to properly calibrate the ${sensor?.device}` });
+      }
     } else {
-      onUpdateHeader(null); // Revert to the default overview title
+      onUpdateHeader(null); 
     }
-    
-    // Cleanup on unmount
     return () => onUpdateHeader(null);
   }, [activeSensorId, onUpdateHeader]);
 
-
   const handleStartCalibration = (id: string) => {
     setActiveSensorId(id);
-    setCalibrationPhase('empty'); // Reset to the "please plug in" state
+    setCalibrationPhase('empty'); 
   };
 
   const handleFinishCalibration = () => {
     if (activeSensorId && !calibratedSensors.includes(activeSensorId)) {
       setCalibratedSensors(prev => [...prev, activeSensorId]);
     }
-    setActiveSensorId(null); // Go back to overview
+    setActiveSensorId(null); 
   };
 
 
@@ -58,10 +52,15 @@ export default function CalibrationStep({
   // VIEW 2: INDIVIDUAL SENSOR CALIBRATION VIEW
   // ==========================================
   if (activeSensorId) {
+    // ROUTE TO EEG COMPONENT IF EEG IS SELECTED
+    if (activeSensorId === 'eeg') {
+      return <EEGCalibrationFlow onFinish={handleFinishCalibration} />;
+    }
+
+    // FALLBACK FOR THE OTHER SENSORS 
     return (
       <div className="animate-in fade-in slide-in-from-right-4 duration-300">
         <div className="rounded-xl border border-gray-200 bg-gray-50/50 p-8 text-center text-sm text-gray-700">
-          
           {calibrationPhase === 'empty' ? (
             <div className="flex flex-col items-center gap-4">
               <p>Empty state [please make sure the tracker is plugged in]</p>
@@ -74,7 +73,7 @@ export default function CalibrationStep({
             </div>
           ) : (
             <div className="flex flex-col items-center gap-4">
-              <p>Screen with eye tracking calibration. Follow 4 dots around.</p>
+              <p>Screen with generic tracking calibration. Follow instructions.</p>
               <button 
                 onClick={handleFinishCalibration}
                 className="mt-4 rounded-lg bg-black px-6 py-2 font-medium text-white hover:bg-gray-800 transition-colors"
@@ -83,25 +82,21 @@ export default function CalibrationStep({
               </button>
             </div>
           )}
-
         </div>
       </div>
     );
   }
 
-
   // ==========================================
-  // VIEW 1: CALIBRATION OVERVIEW LIST
+  // VIEW 1: CALIBRATION OVERVIEW LIST 
   // ==========================================
   return (
     <div className="space-y-6 animate-in fade-in duration-300">
       
-      {/* Info Banner */}
       <div className="rounded-lg border border-blue-200 bg-blue-50/50 p-4 text-sm text-gray-700">
         The calibration process will guide you step-by-step with visual instructions. Each sensor will be calibrated and validated individually before proceeding.
       </div>
 
-      {/* Sensor List */}
       <div className="space-y-4">
         {SENSORS.map((sensor) => {
           const isCalibrated = calibratedSensors.includes(sensor.id);
@@ -125,11 +120,7 @@ export default function CalibrationStep({
               <div className="flex items-center gap-3">
                 <button 
                   onClick={() => handleStartCalibration(sensor.id)}
-                  className={`rounded-lg px-4 py-2 text-xs font-medium transition-colors ${
-                    isCalibrated 
-                      ? 'bg-black text-white hover:bg-gray-800' 
-                      : 'bg-black text-white hover:bg-gray-800' // Uncalibrated button style 
-                  }`}
+                  className="rounded-lg bg-black px-4 py-2 text-xs font-medium text-white hover:bg-gray-800 transition-colors"
                 >
                   {isCalibrated ? 'Re-calibrate' : 'Calibrate'}
                 </button>
@@ -144,7 +135,6 @@ export default function CalibrationStep({
         })}
       </div>
 
-      {/* Action Button */}
       <div className="flex justify-end pt-4">
         <button 
           onClick={onContinue}
