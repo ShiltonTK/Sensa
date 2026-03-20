@@ -23,7 +23,7 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
   const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'done'>('idle');
 
   // Helper to toggle checkboxes
-  const toggleCheck = (id: string, current: string[], setter: React.Dispatch<React.SetStateAction<string[]>>) => {
+  const toggleCheck = (id: string, _current: string[], setter: React.Dispatch<React.SetStateAction<string[]>>) => {
     setter(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   };
 
