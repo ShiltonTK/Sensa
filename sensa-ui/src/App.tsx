@@ -9,7 +9,7 @@ import EnvironmentReadinessStep from './components/steps/EnvironmentReadinessSte
 import CalibrationStep from './components/steps/CalibrationStep'; 
 
 export default function App() {
-  // NEW: State to control whether we are on the Home screen or in the Wizard
+  // State to control whether we are on the Home screen or in the Wizard
   const [appState, setAppState] = useState<'home' | 'wizard'>('home');
   
   const [currentStep, setCurrentStep] = useState(1);
@@ -28,7 +28,7 @@ export default function App() {
     );
   }
 
-  // Otherwise, render the Wizard we built previously
+  // Otherwise, render previous Wizard 
   const stepContent = {
     1: { title: "Study Setup", subtitle: "Configure your research study parameters" },
     2: { title: "Sensor Recommendation", subtitle: "Based on your study configuration, we recommend the following setup:" },
@@ -47,7 +47,7 @@ export default function App() {
       title={headerOverride?.title || currentContent.title}
       subtitle={headerOverride?.subtitle || currentContent.subtitle}
       onBack={() => {
-        // If we are on step 1 and click back, go back to the Home screen!
+        // If we click back we go back to the Home screen
         if (currentStep === 1) {
           setAppState('home');
         } else {
@@ -57,7 +57,10 @@ export default function App() {
       }}
     >
       {currentStep === 1 && (
-        <StudySetupStep onContinue={() => setCurrentStep(2)} />
+        <StudySetupStep 
+          onRecommend={() => setCurrentStep(2)} // Goes to Step 2: Recommendations
+          onManual={() => setCurrentStep(3)}    // Skips to Step 3: Manual Selection
+        />
       )}
       
       {currentStep === 2 && (

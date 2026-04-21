@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Eye, Activity, Heart, Brain, AlertCircle, CheckCircle2 } from 'lucide-react';
 import EEGCalibrationFlow from './EEGCalibrationFlow';
+import EyeTrackerCalibrationFlow from './EyeTrackerCalibrationFlow';
 
 const SENSORS = [
   { id: 'eye', name: 'Eye Tracker', device: 'Tobii Eye Tracker 4C', icon: Eye },
@@ -51,8 +52,14 @@ export default function CalibrationStep({
   // ==========================================
   // VIEW 2: INDIVIDUAL SENSOR CALIBRATION VIEW
   // ==========================================
+  
   if (activeSensorId) {
-    // ROUTE TO EEG COMPONENT IF EEG IS SELECTED
+    // ROUTE TO EYE TRACKER COMPONENT
+    if (activeSensorId === 'eye') {
+      return <EyeTrackerCalibrationFlow onFinish={handleFinishCalibration} />;
+    }
+
+    // ROUTE TO EEG COMPONENT
     if (activeSensorId === 'eeg') {
       return <EEGCalibrationFlow onFinish={handleFinishCalibration} />;
     }

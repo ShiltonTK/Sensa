@@ -1,38 +1,53 @@
 import { useState } from 'react';
-import { Check, CheckCircle2 } from 'lucide-react';
+import { Check, CheckCircle2, HelpCircle } from 'lucide-react';
 
 const CHECKLIST_ITEMS = [
   {
     id: 'seated',
     title: 'Participant seated correctly',
-    description: 'Participant is comfortably seated at the workstation with proper posture'
+    description: 'Participant is comfortably seated at the workstation with proper posture and correct viewing distance (approx. 90cm).',
+    tooltip: [
+      "Ensure the participant sits upright with their back supported and eyes level with the screen.",
+      "Their face should be approximately 90 cm from the monitor (roughly an arm's length).",
+      "Sitting too close or too far reduces eye-tracking accuracy and may cause calibration to fail."
+    ]
   },
   {
     id: 'lighting',
     title: 'Proper Lighting',
-    description: 'Room lighting is consistent and adequate for sensor and eye tracking detection'
+    description: 'Room lighting is consistent, diffused, and free from direct sunlight or strong directional light sources.',
+    tooltip: [
+      "Use consistent indoor lighting at normal office levels. Avoid direct sunlight or bright lamps positioned behind or beside the participant. If sunlight enters the room, close the blinds.",
+      "Very dim lighting should also be avoided as it causes excessive pupil dilation and reduces tracking quality."
+    ]
   },
   {
     id: 'visibility',
     title: 'Sensor Visibility',
-    description: 'All sensors are accessible and visible for calibration'
+    description: 'All sensors are within reach, powered on, and accessible for placement and calibration.',
+    tooltip: [
+      "Confirm that all sensors to be used in this session are visible and reachable.",
+      "The biosignalsplux hub should be powered on and within Bluetooth range of the recording device.",
+      "Electrode cables should be untangled and ready for placement."
+    ]
   },
   {
-    id: 'cleaning', // <--- NEW ITEM
+    id: 'cleaning',
     title: 'Clean and wipe biometric sensors',
-    description: 'All sensors to be used should be wiped with an alcohol swab to ensure easy calibration.'
+    description: 'All sensors to be used should be wiped with an alcohol swab to ensure good signal contact and easy calibration.',
+    tooltip: [
+      "Wipe all electrode contact surfaces with an alcohol-based swab and allow them to dry before placement.",
+      "This removes skin oils and residue that increase contact impedance and degrade signal quality.",
+      "Do not place electrodes on skin until the swab has fully dried."
+    ]
   }
 ];
 
 export default function EnvironmentReadinessStep({ onContinue }: { onContinue: () => void }) {
-  // State for the text inputs
   const [participantName, setParticipantName] = useState('Ali Khan');
   const [participantId, setParticipantId] = useState('SENS-PRJ001-PRT001');
-
-  // State to track which checklist items are completed
   const [completedChecks, setCompletedChecks] = useState<string[]>([]);
 
-  // Toggle a checklist item
   const toggleCheck = (id: string) => {
     setCompletedChecks(prev => 
       prev.includes(id) 
@@ -41,7 +56,6 @@ export default function EnvironmentReadinessStep({ onContinue }: { onContinue: (
     );
   };
 
-  // Check if all items are completed
   const isAllComplete = completedChecks.length === CHECKLIST_ITEMS.length;
 
   return (
@@ -82,32 +96,53 @@ export default function EnvironmentReadinessStep({ onContinue }: { onContinue: (
             <div 
               key={item.id}
               onClick={() => toggleCheck(item.id)}
-              className={`flex cursor-pointer items-center gap-4 rounded-xl border p-5 transition-all duration-200 ${
+              className={`group/card flex cursor-pointer items-start justify-between gap-4 rounded-xl border p-5 transition-all duration-200 ${
                 isChecked 
                   ? 'border-violet-600 bg-violet-50/30' 
                   : 'border-gray-200 bg-white hover:border-gray-300'
               }`}
             >
-              {/* Custom Checkbox */}
-              <div className={`flex h-5 w-5 shrink-0 items-center justify-center rounded border transition-colors ${
-                isChecked 
-                  ? 'border-violet-600 bg-white text-violet-600' 
-                  : 'border-gray-300 bg-white'
-              }`}>
-                {isChecked && <Check className="h-3.5 w-3.5" />}
+              <div className="flex items-start gap-4">
+                {/* Custom Checkbox */}
+                <div className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded border transition-colors ${
+                  isChecked 
+                    ? 'border-violet-600 bg-white text-violet-600' 
+                    : 'border-gray-300 bg-white'
+                }`}>
+                  {isChecked && <Check className="h-3.5 w-3.5" />}
+                </div>
+                
+                {/* Text Content */}
+                <div>
+                  <h4 className="text-sm font-semibold text-gray-900">{item.title}</h4>
+                  <p className="mt-0.5 text-xs text-gray-500 pr-4">{item.description}</p>
+                </div>
               </div>
-              
-              {/* Text Content */}
-              <div>
-                <h4 className="text-sm font-semibold text-gray-900">{item.title}</h4>
-                <p className="mt-0.5 text-xs text-gray-500">{item.description}</p>
+
+              {/* Tooltip Wrapper */}
+              <div 
+                className="group/tooltip relative mt-0.5 p-1"
+                onClick={(e) => e.stopPropagation()} // Prevents the card from toggling if they accidentally click the icon
+              >
+                <HelpCircle className="h-4 w-4 text-gray-400 transition-colors group-hover/tooltip:text-gray-600" />
+                
+                {/* Dark Hover Tooltip */}
+                <div className="pointer-events-none absolute bottom-full right-0 z-10 mb-2 hidden w-80 flex-col gap-3 rounded-xl bg-gray-900 p-4 text-xs font-normal text-gray-200 opacity-0 shadow-xl transition-opacity group-hover/tooltip:pointer-events-auto group-hover/tooltip:flex group-hover/tooltip:opacity-100">
+                  <h5 className="font-semibold text-white">{item.title}</h5>
+                  <div className="space-y-2">
+                    {item.tooltip.map((paragraph, index) => (
+                      <p key={index} className="leading-relaxed">{paragraph}</p>
+                    ))}
+                  </div>
+                </div>
               </div>
+
             </div>
           );
         })}
       </div>
 
-      {/* Success Banner (Only visible when all checks are complete) */}
+      {/* Success Banner */}
       {isAllComplete && (
         <div className="flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 p-4 text-sm font-medium text-green-800 animate-in zoom-in-95 duration-300">
           <CheckCircle2 className="h-5 w-5 text-green-600" />
