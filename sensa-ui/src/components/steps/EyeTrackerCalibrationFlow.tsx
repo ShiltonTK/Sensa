@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { CheckCircle2, Check, XCircle, AlertCircle, Eye } from 'lucide-react';
+import { CheckCircle2, Check, XCircle, AlertCircle } from 'lucide-react';
 
 export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () => void }) {
   const [step, setStep] = useState(1);
