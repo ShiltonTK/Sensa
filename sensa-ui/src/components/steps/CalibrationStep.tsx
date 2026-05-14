@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { Eye, Activity, Heart, Brain, AlertCircle, CheckCircle2 } from 'lucide-react';
 import EEGCalibrationFlow from './EEGCalibrationFlow';
+import ECGCalibrationFlow from './ECGCalibrationFlow';
+import EDACalibrationFlow from './EDACalibrationFlow';
 import EyeTrackerCalibrationFlow from './EyeTrackerCalibrationFlow';
 
 const SENSORS = [
@@ -62,6 +64,16 @@ export default function CalibrationStep({
     // ROUTE TO EEG COMPONENT
     if (activeSensorId === 'eeg') {
       return <EEGCalibrationFlow onFinish={handleFinishCalibration} />;
+    }
+
+    // ROUTE TO ECG COMPONENT
+    if (activeSensorId === 'ecg') {
+      return <ECGCalibrationFlow onFinish={handleFinishCalibration} />;
+    }
+
+    // ROUTE TO GSR/EDA COMPONENT
+    if (activeSensorId === 'gsr') {
+      return <EDACalibrationFlow onFinish={handleFinishCalibration} />;
     }
 
     // FALLBACK FOR THE OTHER SENSORS 
