@@ -1,29 +1,33 @@
 import { useState } from 'react';
-import { Monitor, Smartphone, Wifi, FlaskConical, Eye, Activity, Heart, Brain, CheckSquare } from 'lucide-react';
+import { Monitor, Smartphone, Wifi, FlaskConical, Eye, Activity, Heart, Brain, CheckSquare, ChevronDown } from 'lucide-react';
 
 const STUDY_GOALS = [
   { 
-    id: 'cog_load', 
-    title: 'Cognitive Load', 
-    sensors: 'Sensors: EEG + EDA', 
-    metrics: 'HR ↑, RMSSD ↓, EDA ↑' 
+    id: 'workload', 
+    title: 'User Effort & Workload', 
+    subtitle: 'Mental effort, attention, and task demand',
+    sensors: 'Sensors: Eye Tracker + EEG + EDA + ECG', 
+    metrics: 'fixations ↑, alpha power ↓, EDA peaks ↑, HR ↑ / RMSSD ↓' 
   },
   { 
     id: 'emotion', 
     title: 'Emotional Engagement / Arousal', 
-    sensors: 'Sensors: EDA (+ ECG optional)', 
-    metrics: 'EDA peaks ↑, EDA AUC ↑, HR slight ↑' 
+    subtitle: 'Arousal, stress, and emotional response',
+    sensors: 'Sensors: EDA + ECG + Eye Tracker', 
+    metrics: 'EDA peaks ↑, HR ↑, pupil dilation ↑' 
   },
   { 
     id: 'decision', 
     title: 'Decision-Making Behavior', 
-    sensors: 'Sensors: Eye Tracking + EEG', 
-    metrics: 'Time to first fixation (TTFF), gaze transitions, HR variability changes' 
+    subtitle: 'Choice patterns, hesitation, and decision points',
+    sensors: 'Sensors: Eye Tracker + ECG', 
+    metrics: 'Time to First Fixation (TTFF), gaze transitions, HR variability changes' 
   },
   { 
     id: 'usability', 
     title: 'Usability Friction / Interaction Difficulty', 
-    sensors: 'Sensors: EDA + Eye Tracking', 
+    subtitle: 'Breakdowns, confusion, and interaction errors',
+    sensors: 'Sensors: EDA + ECG + Eye Tracking', 
     metrics: 'EDA spikes, HR ↑, repeated gaze shifts, longer fixations' 
   }
 ];
@@ -35,21 +39,13 @@ const AVAILABLE_EQUIPMENT = [
   { id: 'eeg', name: 'Brain Waves Sensor (EEG)', desc: 'Capture neural activity and cognitive states', icon: Brain }
 ];
 
-export default function StudySetupStep({ 
-  onRecommend, 
-  onManual 
-}: { 
-  onRecommend: () => void;
-  onManual: () => void;
-}) {
-  const [interfaceType, setInterfaceType] = useState('web'); 
-  const [environmentType, setEnvironmentType] = useState('lab');
-  const [selectedGoals, setSelectedGoals] = useState<string[]>(['cog_load', 'emotion']);
-  const [selectedEquipment, setSelectedEquipment] = useState<string[]>(['eye', 'gsr', 'ecg', 'eeg']);
-
-  const toggleGoal = (id: string) => {
-    setSelectedGoals(prev => prev.includes(id) ? prev.filter(g => g !== id) : [...prev, id]);
-  };
+export default function StudySetupStep({ onContinue }: { onContinue: () => void }) {
+  // All states default to empty/null as per the new design
+  const [studyType, setStudyType] = useState('');
+  const [selectedGoal, setSelectedGoal] = useState<string | null>(null);
+  const [selectedEquipment, setSelectedEquipment] = useState<string[]>([]);
+  const [interfaceType, setInterfaceType] = useState<string | null>(null); 
+  const [environmentType, setEnvironmentType] = useState<string | null>(null);
 
   const toggleEquipment = (id: string) => {
     setSelectedEquipment(prev => prev.includes(id) ? prev.filter(e => e !== id) : [...prev, id]);
@@ -65,48 +61,66 @@ export default function StudySetupStep({
           <input 
             type="text" 
             placeholder="Lorem Ipsum"
-            defaultValue="Test Study"
+            defaultValue=""
             className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm text-gray-900 focus:border-violet-600 focus:outline-none focus:ring-1 focus:ring-violet-600"
           />
         </div>
         <div>
           <label className="mb-2 block text-sm font-medium text-gray-700">Study Type <span className="text-red-500">*</span></label>
-          <select className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm text-gray-900 bg-white focus:border-violet-600 focus:outline-none focus:ring-1 focus:ring-violet-600 appearance-none">
-            <option value="screen">Screen Based Usability Testing</option>
-            <option value="mobile">Mobile App Usability Testing</option>
-          </select>
+          <div className="relative">
+            <select 
+              value={studyType}
+              onChange={(e) => setStudyType(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm text-gray-900 bg-white focus:border-violet-600 focus:outline-none focus:ring-1 focus:ring-violet-600 appearance-none pr-10"
+            >
+              <option value="" disabled>Select study type</option>
+              <option value="screen">Screen Based Usability Testing</option>
+              <option value="mobile">Mobile App Usability Testing</option>
+            </select>
+            {/* NEW: Custom Chevron for the dropdown */}
+            <ChevronDown className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500 pointer-events-none" />
+          </div>
         </div>
       </div>
 
-      {/* NEW: Detailed Study Goal Checkboxes */}
-      <div className="rounded-lg border border-gray-200 bg-gray-50/30 p-5">
-        <label className="mb-1 block text-sm font-medium text-gray-900">Study Goal <span className="text-red-500">*</span></label>
-        <p className="mb-4 text-sm text-gray-500">The main purpose of this study is to measure:</p>
+      {/* Detailed Study Goal Radio List */}
+      <div className="rounded-lg border border-gray-200 bg-white">
+        <div className="px-5 pt-5 pb-3">
+          <label className="mb-1 block text-sm font-medium text-gray-900">Study Goal <span className="text-red-500">*</span></label>
+          <p className="text-sm text-gray-500">The main purpose of this study is to measure:</p>
+        </div>
         
-        <div className="space-y-4">
-          {STUDY_GOALS.map((goal) => (
-            <div key={goal.id} className="flex items-start justify-between gap-4">
-              <label className="flex cursor-pointer items-start gap-3 flex-1">
+        <div className="flex flex-col">
+          {STUDY_GOALS.map((goal, index) => (
+            <label 
+              key={goal.id} 
+              className={`flex cursor-pointer items-start justify-between gap-4 px-5 py-4 hover:bg-gray-50 transition-colors ${
+                index !== STUDY_GOALS.length - 1 ? 'border-b border-gray-100' : ''
+              }`}
+            >
+              <div className="flex items-start gap-3">
                 <input 
-                  type="checkbox" 
-                  checked={selectedGoals.includes(goal.id)}
-                  onChange={() => toggleGoal(goal.id)}
-                  className="mt-1 h-4 w-4 rounded border-gray-300 text-violet-600 focus:ring-violet-600" 
+                  type="radio" 
+                  name="studyGoal"
+                  checked={selectedGoal === goal.id}
+                  onChange={() => setSelectedGoal(goal.id)}
+                  className="mt-1 h-4 w-4 border-gray-300 text-violet-600 focus:ring-violet-600" 
                 />
                 <div>
-                  <span className="block text-sm font-semibold text-gray-800">{goal.title}</span>
-                  <span className="block text-xs text-gray-500">{goal.sensors}</span>
+                  <span className="block text-sm font-medium text-gray-900">{goal.title}</span>
+                  <span className="block text-xs text-gray-500 mt-0.5">{goal.subtitle}</span>
                 </div>
-              </label>
-              <div className="hidden text-right text-xs text-gray-500 sm:block max-w-[250px]">
-                {goal.metrics}
               </div>
-            </div>
+              <div className="hidden text-right text-xs sm:block">
+                <span className="block text-gray-600">{goal.sensors}</span>
+                <span className="block text-gray-400 mt-0.5">{goal.metrics}</span>
+              </div>
+            </label>
           ))}
         </div>
       </div>
 
-      {/* NEW: Available Equipment Selection */}
+      {/* Available Equipment Selection */}
       <div>
         <label className="mb-1 block text-sm font-medium text-gray-700">Available Equipment <span className="text-red-500">*</span></label>
         <p className="mb-4 text-sm text-gray-500">What hardware do you have available?</p>
@@ -198,19 +212,13 @@ export default function StudySetupStep({
         </div>
       </div>
 
-      {/* NEW: Action Buttons */}
-      <div className="flex justify-end gap-3 pt-4 border-t border-gray-100">
+      {/* Action Button */}
+      <div className="flex justify-end pt-4 border-t border-gray-100">
         <button 
-          onClick={onManual}
-          className="rounded-lg border border-gray-300 bg-white px-6 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+          onClick={onContinue}
+          className="rounded-lg bg-black px-8 py-3 text-sm font-medium text-white hover:bg-gray-800 transition-colors"
         >
-          Proceed to Manual Sensor Selection
-        </button>
-        <button 
-          onClick={onRecommend}
-          className="rounded-lg bg-black px-6 py-2.5 text-sm font-medium text-white hover:bg-gray-800 transition-colors"
-        >
-          Recommend Sensors
+          Continue to Sensor Selection
         </button>
       </div>
 

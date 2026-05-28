@@ -58,8 +58,7 @@ export default function App() {
     >
       {currentStep === 1 && (
         <StudySetupStep 
-          onRecommend={() => setCurrentStep(2)} // Goes to Step 2: Recommendations
-          onManual={() => setCurrentStep(3)}    // Skips to Step 3: Manual Selection
+          onContinue={() => setCurrentStep(2)} 
         />
       )}
       
