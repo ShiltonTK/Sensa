@@ -11,6 +11,31 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 
+# 1. Tobii Routers Imports
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from routers.analysis import router as analysis_router
+from routers.recording import router as recording_router
+from routers.sensors import router as sensors_router
+from routers.calibration import router as calibration_router
+
+app = FastAPI(title="Sensa Unified Backend")
+
+
+# Mounting the output directory for Tobii heatmap/visualization images
+OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs"
+OUTPUTS_DIR.mkdir(exist_ok=True)
+app.mount("/api/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
+
+# Including the Tobii Routers
+app.include_router(analysis_router)
+app.include_router(recording_router)
+app.include_router(sensors_router)
+app.include_router(calibration_router)
 # ==========================================
 # 1. PLUX CONFIGURATION (Mac Adapted)
 # ==========================================

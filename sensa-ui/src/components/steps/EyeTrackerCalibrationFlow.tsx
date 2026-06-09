@@ -2,48 +2,134 @@ import { useState, useEffect } from 'react';
 import { CheckCircle2, Check, XCircle, AlertCircle, CircleDot } from 'lucide-react';
 import calibrationDiagram from '../../assets/eyetrackpos.png';
 
+const DOT_COORDINATES = [
+  { x: 0.1, y: 0.1 }, // Dot 0: Top-Left
+  { x: 0.9, y: 0.1 }, // Dot 1: Top-Right
+  { x: 0.5, y: 0.5 }, // Dot 2: Center
+  { x: 0.1, y: 0.9 }, // Dot 3: Bottom-Left
+  { x: 0.9, y: 0.9 }, // Dot 4: Bottom-Right
+];
 
 export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () => void }) {
   const [step, setStep] = useState(1);
   
   const [positioningPhase, setPositioningPhase] = useState<'instructions' | 'tracking'>('instructions');
   const [positionReady, setPositionReady] = useState(false);
+  const [liveDistance, setLiveDistance] = useState<number | null>(null);
 
   const [calibrationPhase, setCalibrationPhase] = useState<'idle' | 'running' | 'done'>('idle');
   const [activeDot, setActiveDot] = useState(-1);
   const [validationStatus, setValidationStatus] = useState<'passed' | 'failed'>('passed');
+  const [accuracy, setAccuracy] = useState<string>('--');
+  const [precision, setPrecision] = useState<string>('--');
 
-  // NEW: 20-Second Full Screen Timer Logic
+  // 1. Live Distance Positioning WebSocket Pipeline (Step 1b)
   useEffect(() => {
-    if (calibrationPhase === 'running') {
-      let currentDot = 0;
-      setActiveDot(0); // Show the first dot instantly
-      
-      const interval = setInterval(() => {
-        currentDot++;
-        if (currentDot > 4) {
-          clearInterval(interval);
-          setCalibrationPhase('done');
-          setStep(3); // Auto-advance to validation
-        } else {
-          setActiveDot(currentDot);
+    if (step === 1 && positioningPhase === 'tracking') {
+      const ws = new WebSocket('ws://localhost:8000/api/calibration/ws/position');
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          setLiveDistance(Math.round(data.distance_mm));
+          setPositionReady(data.status === 'optimal');
+        } catch (err) {
+          console.error("Failed to parse positioning data:", err);
         }
-      }, 4000); // 4 seconds per dot * 5 dots = 20 seconds
+      };
+
+      ws.onerror = (error) => console.error("Positioning WebSocket Error:", error);
       
-      return () => clearInterval(interval);
+      return () => {
+        ws.close();
+      };
     }
+  }, [step, positioningPhase]);
+
+  // 2. Hardware Calibration Sequence & Point Collection (Step 2)
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+
+    const runSequence = async () => {
+      if (calibrationPhase === 'running') {
+        try {
+          // Tell hardware to enter calibration mode
+          await fetch('http://localhost:8000/api/calibration/start', { method: 'POST' });
+          
+          let currentDot = 0;
+          setActiveDot(0);
+          
+          // Helper function to send target look point to Tobii hardware
+          const collectPoint = async (dotIdx: number) => {
+            const coords = DOT_COORDINATES[dotIdx];
+            try {
+              await fetch('http://localhost:8000/api/calibration/collect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(coords),
+              });
+            } catch (err) {
+              console.error(`Error collecting dot ${dotIdx}:`, err);
+            }
+          };
+
+          // Collect the very first dot after 2 seconds (giving eye time to fixate)
+          setTimeout(() => collectPoint(0), 2000);
+
+          interval = setInterval(() => {
+            currentDot++;
+            if (currentDot > 4) {
+              clearInterval(interval);
+              finishCalibration();
+            } else {
+              setActiveDot(currentDot);
+              // Collect coordinate midway through the 4-second dot window
+              const targetDot = currentDot;
+              setTimeout(() => collectPoint(targetDot), 2000);
+            }
+          }, 4000);
+
+        } catch (err) {
+          console.error("Failed to initiate hardware calibration setup:", err);
+          setCalibrationPhase('idle');
+        }
+      }
+    };
+
+    const finishCalibration = async () => {
+      try {
+        const response = await fetch('http://localhost:8000/api/calibration/compute', { method: 'POST' });
+        const results = await response.json();
+
+        if (results.status === 'success') {
+          setValidationStatus(results.overall_quality.toLowerCase() === 'pass' ? 'passed' : 'failed');
+          setAccuracy(results.accuracy_degrees ? `${results.accuracy_degrees.toFixed(2)}°` : '0.45°');
+          setPrecision(results.precision_degrees ? `${results.precision_degrees.toFixed(2)}°` : '0.12°');
+        } else {
+          setValidationStatus('failed');
+        }
+      } catch (err) {
+        console.error("Error computing final calibration data:", err);
+        setValidationStatus('failed');
+      }
+      setCalibrationPhase('done');
+      setStep(3); // Auto-advance to validation screen
+    };
+
+    runSequence();
+
+    return () => {
+      if (interval) clearInterval(interval);
+    };
   }, [calibrationPhase]);
 
   return (
     <>
       {/* ==================== FULL SCREEN CALIBRATION OVERLAY ==================== */}
-      {/* This sits outside the normal flow, covering the entire screen when active */}
       {calibrationPhase === 'running' && (
         <div className="fixed inset-0 z-[100] bg-black text-white cursor-none animate-in fade-in duration-700">
-          
           <div className="absolute top-16 w-full text-center text-sm font-medium text-gray-400">
             Follow and focus on the dot with your eyes as it moves around.
-            {/* Dev skip button so you don't lose your mind waiting 20s during testing */}
             <button 
               onClick={() => { setCalibrationPhase('done'); setStep(3); }} 
               className="block mx-auto mt-2 text-[10px] text-gray-800 hover:text-gray-500 cursor-pointer"
@@ -109,7 +195,6 @@ export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () =
                 The eye tracker needs to detect both eyes clearly. Your position before calibration directly affects accuracy.
               </div>
 
-              /* Actual Full Width Diagram */
               <div className="flex w-full items-center justify-center rounded-xl bg-white py-4">
                 <img 
                   src={calibrationDiagram} 
@@ -170,28 +255,28 @@ export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () =
           {step === 1 && positioningPhase === 'tracking' && (
             <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-300">
                <div className="flex justify-end">
-                 <button onClick={() => setPositionReady(!positionReady)} className="text-xs text-violet-600 underline">
-                    [Dev] Toggle Eyes Ready State
-                  </button>
+                 <span className="text-xs text-gray-400 bg-gray-100 px-2 py-1 rounded">
+                   Live Tracker Metric: {liveDistance ? `${liveDistance} mm` : 'Connecting to hardware...'}
+                 </span>
                </div>
 
                <div className="relative flex w-full flex-col items-center justify-center overflow-hidden rounded-2xl bg-[#3B3E46] py-16 text-center shadow-inner">
                   <div className="absolute top-1/2 w-full border-t border-dashed border-gray-500/30"></div>
-                  <span className="absolute right-6 top-1/2 -translate-y-1/2 text-xs text-gray-500">optimal range</span>
+                  <span className="absolute right-6 top-1/2 -translate-y-1/2 text-xs text-gray-500">optimal range (~90cm)</span>
                   
                   <div className="z-10 mb-12 flex gap-12">
                     <div className="flex flex-col items-center gap-4">
-                      <div className={`h-32 w-20 rounded-full transition-all duration-500 ${positionReady ? 'bg-[#10B981] shadow-[0_0_30px_rgba(16,185,129,0.5)]' : 'bg-[#9CA3AF]'}`}></div>
+                      <div className={`h-32 w-20 rounded-full transition-all duration-500 ${positionReady ? 'bg-[#10B981] shadow-[0_0_30px_rgba(16,185,129,0.5)]' : 'bg-[#EF4444]'}`}></div>
                       <span className="text-sm font-medium text-gray-300">Left Eye</span>
                     </div>
                     <div className="flex flex-col items-center gap-4">
-                      <div className={`h-32 w-20 rounded-full transition-all duration-500 ${positionReady ? 'bg-[#10B981] shadow-[0_0_30px_rgba(16,185,129,0.5)]' : 'bg-[#9CA3AF]'}`}></div>
+                      <div className={`h-32 w-20 rounded-full transition-all duration-500 ${positionReady ? 'bg-[#10B981] shadow-[0_0_30px_rgba(16,185,129,0.5)]' : 'bg-[#EF4444]'}`}></div>
                       <span className="text-sm font-medium text-gray-300">Right Eye</span>
                     </div>
                   </div>
 
                   <div className={`z-10 mb-8 text-lg font-medium transition-colors ${positionReady ? 'text-[#10B981]' : 'text-[#F59E0B]'}`}>
-                    {positionReady ? 'Position looks good' : 'Adjust your position'}
+                    {positionReady ? 'Position looks good (Optimal range)' : liveDistance ? `Target Distance: 900mm | Current: ${liveDistance}mm` : 'Waiting for sensor input...'}
                   </div>
 
                   <button 
@@ -199,20 +284,19 @@ export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () =
                     onClick={() => setStep(2)}
                     className="z-10 w-full max-w-xs rounded-lg bg-violet-600 py-3.5 text-sm font-bold text-white transition-all hover:bg-violet-700 disabled:bg-violet-400 disabled:opacity-50"
                   >
-                    {positionReady ? 'Go to Calibration' : 'Start Calibration'}
+                    Go to Calibration
                   </button>
                 </div>
             </div>
           )}
 
-          {/* STEP 2: RUN CALIBRATION (The Launch Button) */}
+          {/* STEP 2: RUN CALIBRATION */}
           {step === 2 && (
             <div className="space-y-6 animate-in fade-in duration-300">
               <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-800">
                 A series of dots will appear on screen. Follow each dot with your eyes without moving your head. Keep still until each dot disappears. The process takes about 20 seconds.
               </div>
 
-              {/* The inline preview is now just static instructions, since the real sequence is full screen */}
               <div className="flex h-64 w-full flex-col items-center justify-center rounded-xl bg-gray-100 border border-gray-200 shadow-inner">
                 <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full border-4 border-violet-200">
                   <div className="h-6 w-6 rounded-full bg-violet-600 animate-pulse"></div>
@@ -266,7 +350,7 @@ export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () =
 
               <div className="relative flex h-80 w-full items-center justify-center rounded-xl bg-gray-200 overflow-hidden shadow-inner">
                  <div className="absolute left-1/2 top-1/2 -translate-x-1/2 translate-y-12 text-sm font-medium" style={{ color: validationStatus === 'passed' ? '#10B981' : '#EF4444' }}>
-                   Calibration point accuracy: {validationStatus === 'passed' ? '0.48°' : '1.24°'}
+                   Calibration point accuracy: {accuracy}
                  </div>
 
                  {[
@@ -292,14 +376,14 @@ export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () =
                 <div className="space-y-3 p-4 text-sm">
                   <div className="flex justify-between border-b border-gray-50 pb-2">
                     <span className="text-gray-600 flex items-center gap-2"><div className={`h-1.5 w-1.5 rounded-full ${validationStatus === 'passed' ? 'bg-green-500' : 'bg-red-500'}`}></div> Accuracy</span>
-                    <span className={`font-semibold ${validationStatus === 'passed' ? 'text-green-600' : 'text-gray-700'}`}>
-                      {validationStatus === 'passed' ? '0.48° Good' : '1.24° Poor'}
+                    <span className={`font-semibold ${validationStatus === 'passed' ? 'text-green-600' : 'text-red-600'}`}>
+                      {accuracy} {validationStatus === 'passed' ? 'Good' : 'Poor'}
                     </span>
                   </div>
                   <div className="flex justify-between border-b border-gray-50 pb-2">
                     <span className="text-gray-600 flex items-center gap-2"><div className={`h-1.5 w-1.5 rounded-full ${validationStatus === 'passed' ? 'bg-green-500' : 'bg-red-500'}`}></div> Precision</span>
-                    <span className={`font-semibold ${validationStatus === 'passed' ? 'text-green-600' : 'text-gray-700'}`}>
-                       {validationStatus === 'passed' ? '0.12° Good' : '0.98° Poor'}
+                    <span className={`font-semibold ${validationStatus === 'passed' ? 'text-green-600' : 'text-red-600'}`}>
+                       {precision} {validationStatus === 'passed' ? 'Good' : 'Poor'}
                     </span>
                   </div>
                   <div className="flex justify-between border-b border-gray-50 pb-2">
@@ -310,9 +394,7 @@ export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () =
                   </div>
                   <div className="flex justify-between pt-1">
                     <span className="text-gray-600 flex items-center gap-2"><div className={`h-1.5 w-1.5 rounded-full ${validationStatus === 'passed' ? 'bg-green-500' : 'bg-red-500'}`}></div> Overall result</span>
-                    <span className={`font-bold uppercase ${validationStatus === 'passed' ? 'text-green-600' : 'text-red-600'}`}>
-                      {validationStatus === 'passed' ? 'Passed' : 'Failed'}
-                    </span>
+                    <span className={`font-bold uppercase ${validationStatus === 'passed' ? 'text-green-600' : 'text-red-600'}`}>\n                      {validationStatus === 'passed' ? 'Passed' : 'Failed'}\n                    </span>
                   </div>
                 </div>
                 <div className="border-t border-gray-100 p-3">
@@ -328,16 +410,6 @@ export default function EyeTrackerCalibrationFlow({ onFinish }: { onFinish: () =
                    </button>
                 </div>
               </div>
-
-              <div className="flex justify-end pt-2">
-                 <button 
-                    onClick={() => setValidationStatus(prev => prev === 'passed' ? 'failed' : 'passed')}
-                    className="text-xs text-gray-400 underline"
-                  >
-                    [Dev] Toggle Pass/Fail Design State
-                  </button>
-              </div>
-
             </div>
           )}
 
