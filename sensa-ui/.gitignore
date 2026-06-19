@@ -22,3 +22,22 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# -----------------------------
+# Biometric Recordings & Data
+# -----------------------------
+backend/data/*.csv
+backend/data/*.h5
+# (Optional) If you want to ignore the whole folder: backend/data/
+
+# -----------------------------
+# Python Virtual Environments
+# -----------------------------
+backend/venv/
+venv/
+env/
+
+# -----------------------------
+# Temporary & Context Files
+# -----------------------------
+changes_for_gemini.txt

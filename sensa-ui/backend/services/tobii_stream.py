@@ -35,6 +35,41 @@ _DLL_SEARCH_PATHS = [
     r"C:\Program Files (x86)\Tobii\Troubleshooter\tobii_stream_engine.dll",
 ]
 
+# Known Tobii calibration / configuration executables, searched in order.
+# The 4C's gaze-model calibration is owned by Tobii's own software; we just
+# launch whichever one is installed.
+_CALIBRATION_EXE_PATHS = [
+    # Tobii EyeX / Core (the 4C stack). The Tray app opens the Tobii menu where
+    # "Create New Profile" / "Recalibrate" lives. (The standalone Configuration
+    # wizard requires elevation and crashes on already-configured devices, so we
+    # avoid it.)
+    r"C:\Program Files (x86)\Tobii\Tobii EyeX Interaction\Tobii.EyeX.Tray.exe",
+    r"C:\Program Files (x86)\Tobii\Tobii EyeX Interaction\Tobii.EyeX.Tools.Tray.exe",
+    r"C:\Program Files (x86)\Tobii\Tobii EyeX Interaction\Tobii.EyeX.Interaction.Settings.UI.exe",
+    r"C:\Program Files\Tobii\Tobii Eye Tracking\TobiiExperience.exe",
+    r"C:\Program Files (x86)\Tobii\Tobii Eye Tracking\TobiiExperience.exe",
+]
+
+# Root folders to scan recursively when the exact paths above miss. Covers the
+# various Tobii stacks (EyeX/Core for the 4C, Tobii Experience, TobiiGaming).
+_TOBII_SCAN_ROOTS = [
+    r"C:\Program Files\Tobii",
+    r"C:\Program Files (x86)\Tobii",
+    r"C:\Program Files\TobiiGaming",
+    r"C:\Program Files (x86)\TobiiGaming",
+]
+
+# Executable name fragments that open the Tobii menu/settings (where
+# "Create New Profile" / "Recalibrate" lives), most preferred first. We avoid
+# "configuration" — that standalone wizard needs elevation and crashes on an
+# already-configured device.
+_CALIBRATION_EXE_NAME_HINTS = [
+    "tray",
+    "tobiiexperience",
+    "settings.ui",
+    "eye tracking",
+]
+
 
 def _find_dll() -> Optional[str]:
     for p in _DLL_SEARCH_PATHS:
@@ -238,5 +273,200 @@ class GazeRecorder:
             pass
 
 
-# Module-level singleton
+# ---------------------------------------------------------------------------
+# Live stream (positioning + validation)
+# ---------------------------------------------------------------------------
+
+class LiveStream:
+    """
+    Runs the 32-bit bridge in a given mode ("position" or "stream") and keeps a
+    thread-safe rolling buffer of the most recent parsed samples. Used by the
+    positioning WebSocket (distance) and the validation flow (accuracy).
+    """
+
+    def __init__(self, mode: str, maxlen: int = 2000) -> None:
+        self._mode = mode
+        self._maxlen = maxlen
+        self._proc: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._samples: list[dict] = []
+        self._total_appended = 0  # monotonic; survives buffer trimming
+        self._running = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def start(self) -> None:
+        if self._running:
+            return
+        if not _bridge_available():
+            raise RuntimeError(
+                "Tobii bridge not available — check 32-bit PowerShell, the "
+                "bridge script, and the Stream Engine DLL"
+            )
+
+        dll = _find_dll()
+        with self._lock:
+            self._samples = []
+            self._total_appended = 0
+
+        self._proc = subprocess.Popen(
+            [
+                _PS32,
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", str(_BRIDGE_SCRIPT),
+                "-Mode", self._mode,
+                "-DllPath", dll,
+            ],
+            stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        # Wait for readiness signal
+        first_line = self._proc.stdout.readline().strip()
+        if not first_line:
+            stderr_out = self._proc.stderr.read()
+            self._proc.kill()
+            raise RuntimeError(f"Bridge failed to start: {stderr_out}")
+        try:
+            status = json.loads(first_line)
+            if status.get("status") != "streaming":
+                raise RuntimeError(f"Unexpected bridge status: {first_line}")
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Bridge returned invalid JSON: {first_line}")
+
+        self._running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+        logger.info("LiveStream started (mode=%s)", self._mode)
+
+    def stop(self) -> None:
+        if not self._running:
+            return
+        try:
+            self._proc.kill()
+        except OSError:
+            pass
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if self._thread:
+            self._thread.join(timeout=3)
+        self._running = False
+        logger.info("LiveStream stopped (mode=%s)", self._mode)
+
+    def latest(self) -> Optional[dict]:
+        with self._lock:
+            return self._samples[-1] if self._samples else None
+
+    def collect(self, window_s: float) -> list[dict]:
+        """Block for window_s, then return samples captured during that window.
+
+        Uses a monotonic append counter (not a list index) so it stays correct
+        even when the rolling buffer trims old samples from the front during a
+        long validation pass.
+        """
+        with self._lock:
+            start_count = self._total_appended
+        time.sleep(window_s)
+        with self._lock:
+            n = self._total_appended - start_count
+            if n <= 0:
+                return []
+            # The n most-recently appended samples are exactly those captured
+            # during the window (samples are only trimmed from the front).
+            return list(self._samples[-n:]) if n <= len(self._samples) else list(self._samples)
+
+    def _reader(self) -> None:
+        try:
+            for line in self._proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sample = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "status" in sample:
+                    continue
+                with self._lock:
+                    self._samples.append(sample)
+                    self._total_appended += 1
+                    if len(self._samples) > self._maxlen:
+                        self._samples = self._samples[-self._maxlen:]
+        except (ValueError, OSError):
+            pass
+
+
+def _find_calibration_exe() -> Optional[str]:
+    """Locate Tobii's calibration/config executable.
+
+    Order: TOBII_CALIBRATION_EXE env override -> known exact paths ->
+    recursive scan of the Tobii install roots, ranked by name hint.
+    """
+    override = os.environ.get("TOBII_CALIBRATION_EXE")
+    if override and os.path.isfile(override):
+        return override
+
+    for exe in _CALIBRATION_EXE_PATHS:
+        if os.path.isfile(exe):
+            return exe
+
+    # Recursive scan, ranked by how well the filename matches a hint.
+    best: Optional[str] = None
+    best_rank = len(_CALIBRATION_EXE_NAME_HINTS)
+    for root in _TOBII_SCAN_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for fname in files:
+                if not fname.lower().endswith(".exe"):
+                    continue
+                lower = fname.lower()
+                for rank, hint in enumerate(_CALIBRATION_EXE_NAME_HINTS):
+                    if hint in lower and rank < best_rank:
+                        best = os.path.join(dirpath, fname)
+                        best_rank = rank
+                        break
+    return best
+
+
+def launch_tobii_calibration() -> bool:
+    """Launch Tobii's own calibration/config app. Returns True if one was found
+    and launched, False otherwise (caller should then guide the user to the
+    Tobii tray icon)."""
+    exe = _find_calibration_exe()
+    if not exe:
+        logger.warning("No Tobii calibration executable found")
+        return False
+    try:
+        subprocess.Popen([exe])
+        logger.info("Launched Tobii calibration: %s", exe)
+        return True
+    except OSError as exc:
+        # WinError 740: the exe requires elevation. Re-launch via ShellExecute
+        # with the "runas" verb so Windows shows a UAC prompt instead.
+        logger.warning("Popen failed for %s (%s); retrying elevated", exe, exc)
+        try:
+            import ctypes  # Windows-only
+            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, None, None, 1)
+            if rc > 32:
+                logger.info("Launched Tobii calibration (elevated): %s", exe)
+                return True
+            logger.warning("ShellExecuteW returned %s for %s", rc, exe)
+        except Exception as exc2:
+            logger.warning("Elevated launch failed for %s: %s", exe, exc2)
+    return False
+
+
+# Module-level singletons
 recorder = GazeRecorder()
+position_stream = LiveStream("position")
+gaze_stream = LiveStream("stream")

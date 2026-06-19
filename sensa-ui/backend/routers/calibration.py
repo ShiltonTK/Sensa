@@ -1,23 +1,45 @@
 import asyncio
 import logging
+import math
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
 from pydantic import BaseModel
 
+from services.tracker import (
+    find_tracker,
+    launch_tobii_calibration,
+    position_stream,
+    gaze_stream,
+    _bridge_available,
+    active_backend,
+)
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/calibration")
 
-# --- Try to load Tobii Pro SDK ---
-try:
-    import tobii_research as tr # type: ignore
-    TOBII_PRO_AVAILABLE = True
-except ImportError:
-    TOBII_PRO_AVAILABLE = False
+# Optimal head distance window (mm from tracker) for the 4C.
+OPTIMAL_MIN_MM = 550.0
+OPTIMAL_MAX_MM = 700.0
 
-# Global state for calibration
-calibration_instance: Optional[object] = None
-current_tracker: Optional[object] = None
+# Physical screen width (mm), used to convert normalized gaze error to degrees
+# of visual angle during validation. Adjust to match the study monitor.
+SCREEN_WIDTH_MM = 520.0
+
+# Fallback viewing distance (mm) if the tracker can't report a live distance.
+# The actual distance is measured from the position stream at the start of each
+# validation pass (see validate_start) and stored in _viewing_distance_mm.
+DEFAULT_VIEWING_DISTANCE_MM = 600.0
+# Sane bounds for a measured distance; anything outside is treated as garbage.
+_MIN_DISTANCE_MM = 300.0
+_MAX_DISTANCE_MM = 1200.0
+_viewing_distance_mm = DEFAULT_VIEWING_DISTANCE_MM
+
+# Default pass threshold for validation (degrees of visual angle). The 4C is a
+# consumer device that typically achieves 2-3° in real conditions, so 2.5° is a
+# reasonable default (3°). The frontend may override this per validation pass.
+ACCURACY_PASS_DEG = 3.0
+MIN_VALID_POINTS = 5
 
 
 class PointRequest(BaseModel):
@@ -25,160 +47,279 @@ class PointRequest(BaseModel):
     y: float  # Normalized 0.0 to 1.0
 
 
+# Holds per-point validation results across the /validate/* calls.
+_validation_points: list[dict] = []
+
+
+def _avg_distance_mm(sample: dict) -> Optional[float]:
+    """Average the valid eyes' Z (distance). Returns None if no valid eye."""
+    zs = []
+    if sample.get("left_valid") and "left_xyz" in sample:
+        zs.append(abs(sample["left_xyz"][2]))
+    if sample.get("right_valid") and "right_xyz" in sample:
+        zs.append(abs(sample["right_xyz"][2]))
+    if not zs:
+        return None
+    return sum(zs) / len(zs)
+
+
+@router.get("/status")
+async def calibration_status():
+    """Report whether a tracker backend and a Tobii device are present."""
+    bridge = _bridge_available()
+    info = find_tracker() if bridge else None
+    return {
+        "bridge_available": bridge,
+        "device_connected": info is not None,
+        "model": info.model if info else None,
+        "serial": info.serial_number if info else None,
+        "backend": active_backend(),  # "stream_engine" | "pro_sdk" | "none"
+    }
+
+
 @router.websocket("/ws/position")
-async def position_stream(websocket: WebSocket):
-    """
-    Streams 3D eye position to the frontend to check if user is ~90cm away.
-    React should subscribe to this for Step 1b.
-    """
+async def position_stream_ws(websocket: WebSocket):
+    """Stream live eye distance/presence to the frontend via the Stream Engine."""
     await websocket.accept()
-    
-    # --- MAC OS / DEV MODE MOCK ---
-    if not TOBII_PRO_AVAILABLE:
+
+    if not _bridge_available():
         try:
-            # Simulate a user slowly moving into the 90cm (900mm) sweet spot
-            mock_z = 1200.0 
             while True:
-                mock_z = max(900.0, mock_z - 5.0)  # Move closer over time
-                
-                payload = {
-                    "left_eye": {"x": 0.5, "y": 0.5, "z": mock_z},
-                    "right_eye": {"x": 0.5, "y": 0.5, "z": mock_z},
-                    "distance_mm": mock_z,
-                    "status": "optimal" if 850 <= mock_z <= 950 else "adjust"
-                }
-                await websocket.send_json(payload)
-                await asyncio.sleep(0.05)  # 20 FPS
+                await websocket.send_json({"distance_mm": -1.0, "status": "no_hardware"})
+                await asyncio.sleep(0.5)
         except WebSocketDisconnect:
             return
 
-    # --- REAL HARDWARE MODE ---
     try:
-        found_trackers = tr.find_all_eyetrackers()
-        if not found_trackers:
-            await websocket.close(code=1008, reason="No tracker found")
-            return
-            
-        tracker = found_trackers[0]
-        
-        # Queue to bridge Tobii's callback thread to FastAPI's async loop
-        queue = asyncio.Queue()
-
-        def gaze_data_callback(gaze_data):
-            # Extract 3D user coordinates (Z is distance from tracker)
-            left_pos = gaze_data['left_eye']['gaze_origin']['position_in_user_coordinates']
-            right_pos = gaze_data['right_eye']['gaze_origin']['position_in_user_coordinates']
-            
-            # Average distance if both eyes are valid
-            valid_z = [z for z in (left_pos[2], right_pos[2]) if not float('nan')]
-            avg_z = sum(valid_z) / len(valid_z) if valid_z else 0.0
-            
-            queue.put_nowait({
-                "left_eye": {"x": left_pos[0], "y": left_pos[1], "z": left_pos[2]},
-                "right_eye": {"x": right_pos[0], "y": right_pos[1], "z": right_pos[2]},
-                "distance_mm": avg_z,
-                "status": "optimal" if 850 <= avg_z <= 950 else "adjust"
-            })
-
-        tracker.subscribe_to(tr.EYETRACKER_GAZE_DATA, gaze_data_callback, as_dictionary=True)
-
+        position_stream.start()
+    except Exception as e:
+        logger.warning("Failed to start position stream: %s", e)
         try:
             while True:
-                payload = await queue.get()
-                await websocket.send_json(payload)
+                await websocket.send_json({"distance_mm": -1.0, "status": "no_hardware"})
+                await asyncio.sleep(0.5)
         except WebSocketDisconnect:
-            tracker.unsubscribe_from(tr.EYETRACKER_GAZE_DATA, gaze_data_callback)
-    
+            return
+
+    try:
+        while True:
+            sample = position_stream.latest()
+            if sample is None:
+                await websocket.send_json({"distance_mm": -1.0, "status": "adjust"})
+            elif sample.get("normalized"):
+                # Normalized [0,1] track-box depth: ~0.5 is centered/ideal.
+                z = _avg_distance_mm(sample)
+                status = "optimal" if (z is not None and 0.35 <= z <= 0.65) else "adjust"
+                await websocket.send_json({
+                    "distance_mm": -1.0, "normalized_z": z, "status": status,
+                })
+            else:
+                dist = _avg_distance_mm(sample)
+                if dist is None:
+                    await websocket.send_json({"distance_mm": -1.0, "status": "adjust"})
+                else:
+                    status = "optimal" if OPTIMAL_MIN_MM <= dist <= OPTIMAL_MAX_MM else "adjust"
+                    await websocket.send_json({"distance_mm": dist, "status": status})
+            await asyncio.sleep(0.05)
+    except WebSocketDisconnect:
+        position_stream.stop()
+
+
+@router.post("/launch-tobii")
+async def launch_tobii():
+    """Launch Tobii's own calibration app (the 4C calibrates through Tobii's
+    software, not the Pro SDK)."""
+    launched = launch_tobii_calibration()
+    return {
+        "launched": launched,
+        "message": (
+            "Tobii menu opened — click the Tobii tray icon and choose "
+            "'Create New Profile' (or Recalibrate), complete the calibration, "
+            "then return here."
+            if launched else
+            "Could not open Tobii's app automatically. Click the Tobii icon in "
+            "your Windows tray (bottom-right, under the ^), choose 'Create New "
+            "Profile', calibrate, then return here."
+        ),
+    }
+
+
+@router.websocket("/ws/gaze")
+async def gaze_ws(websocket: WebSocket):
+    """Stream the live gaze point (normalized [0,1] on the display) to the
+    frontend so the user can see where they're looking. Reads the shared gaze
+    buffer that the validation flow also uses."""
+    await websocket.accept()
+    try:
+        while True:
+            sample = gaze_stream.latest() if gaze_stream.is_running else None
+            if sample is None:
+                await websocket.send_json({"valid": False})
+            else:
+                xs, ys = [], []
+                if sample.get("left_gaze_point_validity"):
+                    gp = sample.get("left_gaze_point_on_display_area")
+                    if gp:
+                        xs.append(gp[0]); ys.append(gp[1])
+                if sample.get("right_gaze_point_validity"):
+                    gp = sample.get("right_gaze_point_on_display_area")
+                    if gp:
+                        xs.append(gp[0]); ys.append(gp[1])
+                if xs:
+                    await websocket.send_json({
+                        "valid": True,
+                        "x": sum(xs) / len(xs),
+                        "y": sum(ys) / len(ys),
+                    })
+                else:
+                    await websocket.send_json({"valid": False})
+            await asyncio.sleep(0.03)
+    except WebSocketDisconnect:
+        return
+
+
+@router.post("/validate/start")
+async def validate_start():
+    """Begin a validation pass by starting the live gaze stream.
+
+    Before switching to gaze, briefly sample the position stream to measure the
+    participant's real viewing distance, so the accuracy-in-degrees conversion
+    reflects their actual seating distance instead of a fixed assumption."""
+    global _validation_points, _viewing_distance_mm
+    _validation_points = []
+    _viewing_distance_mm = DEFAULT_VIEWING_DISTANCE_MM
+
+    if not _bridge_available():
+        raise HTTPException(status_code=400, detail="Eye tracker not available.")
+
+    # Best-effort live-distance capture. Only absolute-mm samples are usable;
+    # backends that report a normalized [0,1] track-box depth are skipped (the
+    # >_MIN_DISTANCE_MM check filters those out) and we keep the default.
+    try:
+        position_stream.start()
+        dists = []
+        for _ in range(20):
+            s = position_stream.latest()
+            d = _avg_distance_mm(s) if s else None
+            if d is not None and _MIN_DISTANCE_MM <= d <= _MAX_DISTANCE_MM:
+                dists.append(d)
+            await asyncio.sleep(0.05)
+        if dists:
+            _viewing_distance_mm = sum(dists) / len(dists)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not measure live viewing distance: %s", e)
+    finally:
+        try:
+            position_stream.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        gaze_stream.start()
     except Exception as e:
-        logger.error(f"WebSocket Error: {e}")
-        await websocket.close()
+        raise HTTPException(status_code=400, detail=f"Failed to start gaze stream: {e}")
+    return {"status": "validation_started", "viewing_distance_mm": round(_viewing_distance_mm, 1)}
 
 
-@router.post("/start")
-async def start_calibration():
-    """Step 2: Triggered when the React 20-second overlay appears."""
-    global calibration_instance, current_tracker
-    
-    if not TOBII_PRO_AVAILABLE:
-        return {"status": "mock_calibration_started"}
+@router.post("/validate/point")
+async def validate_point(point: PointRequest):
+    """Collect ~1.5s of gaze while the user looks at (x, y); compute per-point
+    accuracy in degrees of visual angle."""
+    if not gaze_stream.is_running:
+        raise HTTPException(status_code=400, detail="Validation not started.")
 
-    found_trackers = tr.find_all_eyetrackers()
-    if not found_trackers:
-        raise HTTPException(status_code=400, detail="No eye tracker connected.")
-        
-    current_tracker = found_trackers[0]
-    calibration_instance = tr.ScreenBasedCalibration(current_tracker)
-    calibration_instance.enter_calibration_mode()
-    
-    return {"status": "calibration_mode_active"}
+    # collect() blocks ~1.5s, so run it off the event loop.
+    samples = await asyncio.to_thread(gaze_stream.collect, 1.5)
+
+    # Average both eyes per sample — same as the live gaze cursor (/ws/gaze) so
+    # what the user sees on screen matches what we score. Using the left eye
+    # alone (as before) caused points to fail even when the binocular cursor sat
+    # dead-on the target.
+    gxs, gys = [], []
+    for s in samples:
+        exs, eys = [], []
+        if s.get("left_gaze_point_validity"):
+            gp = s.get("left_gaze_point_on_display_area")
+            if gp:
+                exs.append(gp[0]); eys.append(gp[1])
+        if s.get("right_gaze_point_validity"):
+            gp = s.get("right_gaze_point_on_display_area")
+            if gp:
+                exs.append(gp[0]); eys.append(gp[1])
+        if exs:
+            gxs.append(sum(exs) / len(exs))
+            gys.append(sum(eys) / len(eys))
+
+    valid_samples = len(gxs)
+    total_samples = len(samples)
+    if valid_samples == 0:
+        result = {"x": point.x, "y": point.y, "valid": False, "valid_samples": 0,
+                  "total_samples": total_samples, "accuracy_degrees": None}
+        _validation_points.append(result)
+        return result
+
+    mean_x = sum(gxs) / valid_samples
+    mean_y = sum(gys) / valid_samples
+
+    # Accuracy: normalized error -> mm on screen -> degrees at the measured
+    # viewing distance (captured in validate_start; falls back to the default).
+    dist_mm = _viewing_distance_mm
+    err_norm = math.hypot(mean_x - point.x, mean_y - point.y)
+    err_mm = err_norm * SCREEN_WIDTH_MM
+    acc_deg = math.degrees(math.atan2(err_mm, dist_mm))
+
+    # Precision: spread of samples around their own mean (RMS), -> degrees.
+    spread_norm = math.sqrt(
+        sum((sx - mean_x) ** 2 + (sy - mean_y) ** 2 for sx, sy in zip(gxs, gys)) / valid_samples
+    )
+    prec_deg = math.degrees(math.atan2(spread_norm * SCREEN_WIDTH_MM, dist_mm))
+
+    result = {
+        "x": point.x, "y": point.y, "valid": True,
+        "valid_samples": valid_samples, "total_samples": total_samples,
+        "accuracy_degrees": acc_deg, "precision_degrees": prec_deg,
+        "mean_x": mean_x, "mean_y": mean_y,
+    }
+    _validation_points.append(result)
+    return result
 
 
-@router.post("/collect")
-async def collect_calibration_point(point: PointRequest):
-    """
-    Called by React when the dot pauses at one of the 5 positions.
-    React should send normalized coordinates (e.g., Center = x:0.5, y:0.5).
-    """
-    if not TOBII_PRO_AVAILABLE:
-        await asyncio.sleep(0.5)  # Simulate collection time
-        return {"status": "mock_point_collected", "point": point.dict()}
+@router.post("/validate/finish")
+async def validate_finish(accuracy_pass_deg: float = ACCURACY_PASS_DEG):
+    """Stop the gaze stream and aggregate the validation pass into a real
+    accuracy/precision report. The pass threshold (degrees) may be overridden
+    via the `accuracy_pass_deg` query param; defaults to ACCURACY_PASS_DEG."""
+    gaze_stream.stop()
 
-    if not calibration_instance:
-        raise HTTPException(status_code=400, detail="Calibration not started.")
+    threshold = accuracy_pass_deg if accuracy_pass_deg > 0 else ACCURACY_PASS_DEG
 
-    # Tells the hardware to calculate eye angles for this specific screen coordinate
-    status = calibration_instance.collect_data(point.x, point.y)
-    
-    if status != tr.CALIBRATION_STATUS_SUCCESS:
-        return {"status": "failed_to_collect", "reason": str(status)}
-        
-    return {"status": "success", "point": point.dict()}
+    valid = [p for p in _validation_points if p.get("valid")]
+    valid_count = len(valid)
 
-
-@router.post("/compute")
-async def compute_calibration():
-    """Step 3: Called after all 5 points are collected to get validation data."""
-    global calibration_instance
-    
-    if not TOBII_PRO_AVAILABLE:
-        # Return mock Pass/Fail data to populate Step 3 of your UI
+    if valid_count == 0:
         return {
-            "status": "success",
-            "overall_quality": "Pass",
-            "accuracy_degrees": 0.45,
-            "precision_degrees": 0.12,
-            "points": [
-                {"x": 0.5, "y": 0.5, "valid": True},
-                {"x": 0.1, "y": 0.1, "valid": True},
-                {"x": 0.9, "y": 0.1, "valid": True},
-                {"x": 0.1, "y": 0.9, "valid": True},
-                {"x": 0.9, "y": 0.9, "valid": True},
-            ]
+            "status": "success", "overall_quality": "Fail",
+            "accuracy_degrees": 0.0, "precision_degrees": 0.0,
+            "valid_count": 0, "threshold_degrees": threshold,
+            "points": _validation_points,
         }
 
-    if not calibration_instance:
-        raise HTTPException(status_code=400, detail="Calibration not started.")
+    avg_acc = sum(p["accuracy_degrees"] for p in valid) / valid_count
+    avg_prec = sum(p["precision_degrees"] for p in valid) / valid_count
 
-    result = calibration_instance.compute_and_apply()
-    calibration_instance.leave_calibration_mode()
-    calibration_instance = None
+    total_valid = sum(p.get("valid_samples", 0) for p in _validation_points)
+    total_all = sum(p.get("total_samples", 0) for p in _validation_points)
+    valid_data_yield = round((total_valid / total_all * 100), 1) if total_all > 0 else 0.0
 
-    if result.status != tr.CALIBRATION_STATUS_SUCCESS:
-        return {"status": "failed", "overall_quality": "Fail"}
+    overall = "Pass" if (valid_count >= MIN_VALID_POINTS and avg_acc <= threshold) else "Fail"
 
-    # Extract hardware precision data from the Tobii result object
-    points_data = []
-    for point in result.calibration_points:
-        points_data.append({
-            "x": point.position_on_display_area[0],
-            "y": point.position_on_display_area[1],
-            "valid": len(point.calibration_samples) > 0
-        })
-
-    # You can calculate actual average accuracy from point.calibration_samples here
-    # For now, we return the parsed structure React needs.
     return {
         "status": "success",
-        "overall_quality": "Pass",
-        "points": points_data
+        "overall_quality": overall,
+        "accuracy_degrees": avg_acc,
+        "precision_degrees": avg_prec,
+        "valid_data_yield": valid_data_yield,
+        "valid_count": valid_count,
+        "threshold_degrees": threshold,
+        "points": _validation_points,
     }

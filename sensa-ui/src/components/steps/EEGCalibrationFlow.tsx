@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react';
-import { CheckCircle2, AlertCircle, Activity, Check } from 'lucide-react';
+import { useState, useEffect, useMemo } from 'react';
+import { CheckCircle2, AlertCircle, Check } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, ResponsiveContainer } from 'recharts';
+import { computeSignalMetrics, toneClasses } from '../../lib/signalMetrics';
 
 import headFrontImg from '../../assets/BwFront.png';
 import headSideImg from '../../assets/BwSideview.png';
@@ -18,29 +20,144 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
 
   // Step 3 State
   const [signalStatus, setSignalStatus] = useState<'unknown' | 'checking' | 'good'>('unknown');
+  const [wsState, setWsState] = useState<'idle' | 'connecting' | 'streaming' | 'error' | 'closed'>('idle');
+  const [pluxStatus, setPluxStatus] = useState<
+    {
+      plux_available: boolean;
+      device_address: string | null;
+      channel_map: Record<string, number>;
+      sensors?: { type: string | null; port: number; clas: number | null; detected: boolean }[];
+      running?: boolean;
+      import_error?: string | null;
+      error?: string | null;
+    } | null
+  >(null);
 
   // Step 4 State
   const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'done'>('idle');
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [saveData, setSaveData] = useState<{ filename: string; rows: number } | null>(null);
+  // Baseline stability verdict from the backend (computed over the full recording).
+  const [baseline, setBaseline] = useState<{ stable: boolean | null; reason?: string } | null>(null);
+
+  // Rolling buffer of the last 60 live samples for the waveform preview
+  const [chartData, setChartData] = useState<{ uv: number }[]>([]);
+
+  // Live signal-quality metrics derived from the rolling buffer.
+  const metrics = useMemo(() => computeSignalMetrics(chartData.map(d => d.uv)), [chartData]);
+  const ampTone = toneClasses(metrics?.amplitudeQuality.tone ?? 'idle');
+  const noiseTone = toneClasses(metrics?.noiseQuality.tone ?? 'idle');
+
+  // Live hub readout for Step 2 (which channel EEG is on, sensor detected, etc.)
+  const hubConnected = !!pluxStatus?.running && !!pluxStatus?.device_address;
+  const eegPort = pluxStatus?.channel_map?.eeg;
+  const eegSensor = pluxStatus?.sensors?.find(s => s.type === 'eeg');
 
   // Helper to toggle checkboxes
   const toggleCheck = (id: string, _current: string[], setter: React.Dispatch<React.SetStateAction<string[]>>) => {
     setter(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   };
 
-  // Simulate Baseline Recording Timer
+  // Live WebSocket to the biosignalsplux hub (shared stream). Connects once we
+  // reach the Signal Check step; reads this flow's eeg_raw channel.
   useEffect(() => {
-    if (recordingState === 'recording') {
-      const timer = setTimeout(() => setRecordingState('done'), 3000); // 3 second mock recording
-      return () => clearTimeout(timer);
-    }
-  }, [recordingState]);
+    if (step < 3) return;
+    setWsState('connecting');
+    const ws = new WebSocket('ws://localhost:8000/ws/stream');
+    ws.onmessage = (event) => {
+      let data: any;
+      try { data = JSON.parse(event.data); } catch { return; }
+      if (data.status === 'streaming') { setWsState('streaming'); return; }
+      if (data.status) return;
+      if (data.eeg_raw === undefined || data.eeg_raw === null) return;
+      setWsState('streaming');
+      setChartData(prev => {
+        const newData = [...prev, { uv: data.eeg_raw }];
+        if (newData.length > 60) newData.shift();
+        return newData;
+      });
+      setSignalStatus((prev) => (prev === 'checking' ? 'good' : prev));
+    };
+    ws.onerror = () => setWsState('error');
+    ws.onclose = () => setWsState(s => s === 'error' ? s : 'closed');
+    return () => ws.close();
+  }, [step]);
 
+  // Step 2: poll the hub so the setup screen shows, live, which channel the
+  // EEG sensor is on and whether the hub actually reports a sensor there.
+  // /api/plux/detect connects (idempotent) and returns the channel/sensor map.
+  // Polled sequentially (chained timeout) so a slow Bluetooth scan can't stack.
+  useEffect(() => {
+    if (step !== 2) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const poll = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/api/plux/detect');
+        const data = await res.json();
+        if (!cancelled) setPluxStatus(data);
+      } catch {
+        if (!cancelled) setPluxStatus(null);
+      }
+      if (!cancelled) timer = setTimeout(poll, 3000);
+    };
+    poll();
+
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [step]);
+
+  // Countdown timer effect — ticks every second while recording.
+  useEffect(() => {
+    if (countdown === null || countdown <= 0) return;
+    const t = setTimeout(() => setCountdown(c => (c !== null ? c - 1 : null)), 1000);
+    return () => clearTimeout(t);
+  }, [countdown]);
+
+  // Real 20s baseline recording driven by the backend PLUX recorder.
+  const startRealRecording = async () => {
+    setRecordingState('recording');
+    setCountdown(20);
+    setSaveData(null);
+    setBaseline(null);
+    try {
+      await fetch('http://localhost:8000/api/record/start', { method: 'POST' });
+      setTimeout(async () => {
+        const stopRes = await fetch('http://localhost:8000/api/record/stop', { method: 'POST' });
+        const stopInfo = await stopRes.json();
+        // Backend assesses stability over the full recording; read the EEG verdict.
+        const q = stopInfo?.quality?.eeg;
+        setBaseline(q ? { stable: q.stable, reason: q.reason } : { stable: null });
+        const res = await fetch('http://localhost:8000/api/record/save', { method: 'POST' });
+        const info = await res.json();
+        setSaveData({ filename: info.filename, rows: info.rows });
+        setCountdown(null);
+        setRecordingState('done');
+      }, 20000);
+    } catch (error) {
+      console.error('Failed to trigger backend recording:', error);
+      setRecordingState('idle');
+    }
+  };
+
+  const handleExport = async () => {
+    await fetch('http://localhost:8000/api/record/save', { method: 'POST' });
+    const res = await fetch('http://localhost:8000/api/record/download');
+    if (!res.ok) return;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = saveData?.filename ?? 'plux_recording.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="animate-in fade-in slide-in-from-right-4 duration-300">
       
       {/* SUCCESS BANNER (Only in Step 4 when done) */}
-      {step === 4 && recordingState === 'done' && (
+      {step === 4 && recordingState === 'done' && baseline?.stable !== false && (
         <div className="mb-6 flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 p-4 text-sm font-medium text-green-800">
           <CheckCircle2 className="h-5 w-5 text-green-600" />
           EEG Sensor Successfully calibrated
@@ -152,10 +269,42 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
           <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
             
             {/* Hub Image */}
-            <div className="flex items-center justify-center rounded-lg border border-gray-200 bg-white p-6">
-              <img src={deviceHubImg} alt="Device hub connection guide" className="w-full max-w-sm object-contain" />
+            <div className="space-y-4">
+              <div className="flex items-center justify-center rounded-lg border border-gray-200 bg-white p-6">
+                <img src={deviceHubImg} alt="Device hub connection guide" className="w-full max-w-sm object-contain" />
+              </div>
+
+              {/* Live hub status — updates as the user plugs in the sensor */}
+              <div className="rounded-lg border border-gray-200 bg-white">
+                <h4 className="border-b border-gray-200 bg-gray-100 px-4 py-2 text-xs font-bold uppercase text-gray-700 flex items-center gap-2">
+                  <div className={`h-1.5 w-1.5 rounded-full ${hubConnected ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}></div>
+                  Live Hub Status
+                </h4>
+                <div className="space-y-2 p-4 text-sm">
+                  <div className="flex justify-between gap-4">
+                    <span className="text-gray-600">Device</span>
+                    <span className="font-medium text-gray-900 text-right break-all">
+                      {pluxStatus?.device_address
+                        || (pluxStatus?.plux_available === false ? 'plux.pyd not loaded' : 'Scanning…')}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">EEG channel</span>
+                    <span className="font-medium text-gray-900">{eegPort !== undefined ? eegPort : '—'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">Sensor on channel</span>
+                    <span className={`font-medium ${eegSensor?.detected ? 'text-green-600' : 'text-gray-500'}`}>
+                      {eegSensor?.detected
+                        ? `Detected${eegSensor.clas != null ? ` (class ${eegSensor.clas})` : ''}`
+                        : hubConnected ? 'Using default' : '—'}
+                    </span>
+                  </div>
+                  {pluxStatus?.error && <div className="text-[11px] text-red-500">{pluxStatus.error}</div>}
+                </div>
+              </div>
             </div>
-            
+
             <div className="space-y-6">
               <div className="flex items-center gap-3 rounded-lg border border-yellow-200 bg-yellow-50/50 p-4 text-sm text-yellow-800">
                 <AlertCircle className="h-5 w-5 text-yellow-600" />
@@ -167,7 +316,7 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
                 <div className="space-y-2 px-1">
                   <label className="flex cursor-pointer items-center gap-3 text-sm text-gray-700 hover:text-gray-900">
                     <input type="checkbox" checked={step2Checks.includes('conn1')} onChange={() => toggleCheck('conn1', step2Checks, setStep2Checks)} className="h-4 w-4 rounded border-gray-300 text-violet-600 focus:ring-violet-600" />
-                    Plug ECG cable into an analog input port
+                    Plug EEG cable into an analog input port
                   </label>
                 </div>
               </div>
@@ -177,15 +326,27 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
                 <div className="space-y-2 px-1">
                   <label className="flex cursor-pointer items-center gap-3 text-sm text-gray-700 hover:text-gray-900">
                     <input type="checkbox" checked={step2Checks.includes('en1')} onChange={() => toggleCheck('en1', step2Checks, setStep2Checks)} className="h-4 w-4 rounded border-gray-300 text-violet-600 focus:ring-violet-600" />
-                    Setup ECG Channel on Hub
+                    Setup EEG Channel on Hub
                   </label>
                   <label className="flex cursor-pointer items-center gap-3 text-sm text-gray-700 hover:text-gray-900">
                     <input type="checkbox" checked={step2Checks.includes('en2')} onChange={() => toggleCheck('en2', step2Checks, setStep2Checks)} className="h-4 w-4 rounded border-gray-300 text-violet-600 focus:ring-violet-600" />
-                    Activate ECG channel in system
+                    Activate EEG channel in system
+                    <span className={`ml-auto rounded px-2 py-0.5 text-[11px] font-medium ${hubConnected && eegPort !== undefined ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
+                      {hubConnected && eegPort !== undefined ? `Channel ${eegPort}` : 'Detecting…'}
+                    </span>
                   </label>
                   <label className="flex cursor-pointer items-center gap-3 text-sm text-gray-700 hover:text-gray-900">
                     <input type="checkbox" checked={step2Checks.includes('en3')} onChange={() => toggleCheck('en3', step2Checks, setStep2Checks)} className="h-4 w-4 rounded border-gray-300 text-violet-600 focus:ring-violet-600" />
-                    Set channel type to ECG
+                    Set channel type to EEG
+                    <span className={`ml-auto rounded px-2 py-0.5 text-[11px] font-medium ${
+                      eegSensor?.detected ? 'bg-green-100 text-green-700'
+                      : hubConnected ? 'bg-yellow-100 text-yellow-700'
+                      : 'bg-gray-100 text-gray-500'}`}>
+                      {eegSensor?.detected
+                        ? `EEG sensor${eegSensor.clas != null ? ` (class ${eegSensor.clas})` : ''}`
+                        : hubConnected ? `Default ch ${eegPort ?? '?'}`
+                        : 'Detecting…'}
+                    </span>
                   </label>
                 </div>
               </div>
@@ -206,9 +367,36 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
           <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
             <div>
               <p className="mb-4 text-center text-sm font-semibold text-gray-700">Live EEG waveform preview:</p>
-              <div className="flex h-48 w-full items-center justify-center overflow-hidden rounded-lg border border-red-100 bg-red-50/30 text-red-500">
-                {/* Simulated Waveform */}
-                <Activity className={`h-32 w-full stroke-[0.5] ${signalStatus === 'checking' ? 'animate-pulse' : ''}`} />
+              <div className="h-48 w-full overflow-hidden rounded-lg border border-gray-100 bg-gray-50/50">
+                {chartData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 4, right: 8, left: 4, bottom: 20 }}>
+                      <XAxis
+                        tickFormatter={(i: number) => `${((i / 60) * 2.4).toFixed(0)}s`}
+                        tick={{ fontSize: 10, fill: '#9ca3af' }}
+                        label={{ value: 'Time (last ~2.4 s)', position: 'insideBottom', offset: -8, fontSize: 10, fill: '#9ca3af' }}
+                      />
+                      <YAxis
+                        domain={['auto', 'auto']}
+                        tick={{ fontSize: 10, fill: '#9ca3af' }}
+                        width={48}
+                        label={{ value: 'EEG (raw)', angle: -90, position: 'insideLeft', offset: 10, fontSize: 10, fill: '#9ca3af' }}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="uv"
+                        stroke="#7C3AED"
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="flex h-full w-full items-center justify-center">
+                    <span className="text-xs text-gray-400">Awaiting sensor data...</span>
+                  </div>
+                )}
               </div>
             </div>
             
@@ -222,27 +410,28 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
                     <span className="font-medium text-green-600">Connected</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-gray-600">• Signal amplitude</span>
-                    <span className={`font-medium ${signalStatus === 'good' ? 'text-green-600' : 'text-yellow-600'}`}>
-                      {signalStatus === 'good' ? 'Normal' : signalStatus === 'checking' ? 'Checking...' : 'Medium'}
+                    <span className="text-gray-600 flex items-center gap-2"><div className={`h-1.5 w-1.5 rounded-full ${ampTone.dot}`}></div> Signal amplitude</span>
+                    <span className={`font-medium ${ampTone.text}`}>
+                      {metrics ? metrics.amplitudeQuality.label : 'Checking...'}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-gray-600">• Noise level</span>
-                    <span className={`font-medium ${signalStatus === 'good' ? 'text-green-600' : 'text-red-600'}`}>
-                      {signalStatus === 'good' ? 'Low' : signalStatus === 'checking' ? 'Checking...' : 'High'}
+                    <span className="text-gray-600 flex items-center gap-2"><div className={`h-1.5 w-1.5 rounded-full ${noiseTone.dot}`}></div> Noise level</span>
+                    <span className={`font-medium ${noiseTone.text}`}>
+                      {metrics ? metrics.noiseQuality.label : 'Checking...'}
                     </span>
                   </div>
                 </div>
                 <div className="border-t border-gray-100 p-3 text-center">
                   <button 
                     onClick={() => {
+                      // The WebSocket onmessage flips status to 'good' as soon
+                      // as real hardware frames arrive.
                       setSignalStatus('checking');
-                      setTimeout(() => setSignalStatus('good'), 1500);
                     }}
                     className="text-sm font-medium text-violet-600 hover:text-violet-800"
                   >
-                    Run Signal Check
+                    Rerun Signal Check
                   </button>
                 </div>
               </div>
@@ -256,8 +445,8 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
                  </ul>
               </div>
 
-              <button 
-                disabled={signalStatus !== 'good'}
+              <button
+                disabled={wsState !== 'streaming'}
                 onClick={() => setStep(4)}
                 className="w-full rounded-lg bg-violet-600 py-3 text-sm font-medium text-white transition-all hover:bg-violet-700 disabled:bg-violet-200 disabled:cursor-not-allowed"
               >
@@ -270,25 +459,54 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
         {/* ==================== STEP 4 ==================== */}
         {step === 4 && (
           <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
-            <div className="flex flex-col items-center justify-center text-center">
-              <p className="mb-8 rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-800">
+            <div className="flex flex-col items-center text-center">
+              <p className="mb-4 rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-800">
                 To ensure validity of recordings, it is crucial to record the participant's baseline values.
               </p>
-              <p className="mb-6 text-sm font-medium text-gray-900">
-                Press the record button, then focus on the circle for 20 seconds.
-              </p>
-              
-              <div className={`mb-8 h-40 w-40 rounded-full border-4 border-dashed transition-colors duration-500 ${
-                recordingState === 'recording' ? 'border-violet-600 bg-violet-100 animate-pulse' : 'border-slate-800 bg-slate-600'
-              }`}></div>
 
-              <button 
-                onClick={() => setRecordingState('recording')}
+              {/* Live waveform during recording */}
+              <div className="mb-4 h-24 w-full overflow-hidden rounded-lg border border-gray-100 bg-gray-50/50">
+                {chartData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 2, right: 4, left: 4, bottom: 2 }}>
+                      <YAxis
+                        domain={['auto', 'auto']}
+                        tick={{ fontSize: 9, fill: '#9ca3af' }}
+                        width={42}
+                        label={{ value: 'EEG', angle: -90, position: 'insideLeft', offset: 10, fontSize: 9, fill: '#9ca3af' }}
+                      />
+                      <Line type="monotone" dataKey="uv" stroke="#7C3AED" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="flex h-full items-center justify-center">
+                    <span className="text-xs text-gray-400">Awaiting signal...</span>
+                  </div>
+                )}
+              </div>
+
+              <p className="mb-4 text-sm font-medium text-gray-900">
+                Press record, then focus on the circle for 20 seconds.
+              </p>
+
+              <div className={`mb-6 h-40 w-40 rounded-full border-4 border-dashed transition-colors duration-500 flex items-center justify-center ${
+                recordingState === 'recording' ? 'border-violet-600 bg-violet-100 animate-pulse' : 'border-slate-800 bg-slate-600'
+              }`}>
+                {recordingState === 'recording' && countdown !== null && (
+                  <span className="text-3xl font-bold text-violet-700 tabular-nums">{countdown}</span>
+                )}
+              </div>
+
+              <button
+                onClick={startRealRecording}
                 disabled={recordingState === 'recording'}
                 className="rounded-lg bg-violet-600 px-8 py-2.5 text-sm font-medium text-white transition-all hover:bg-violet-700 disabled:opacity-50"
               >
                 {recordingState === 'idle' ? 'Start Recording' : recordingState === 'recording' ? '• Recording...' : 'Record Again'}
               </button>
+              {saveData && (
+                <p className="mt-3 text-xs text-gray-400">{saveData.filename} · {saveData.rows} samples</p>
+              )}
             </div>
             
             <div className="space-y-6">
@@ -300,17 +518,25 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
                     <span className="font-medium text-green-600">Connected</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-gray-600">• Signal amplitude</span>
-                    <span className="font-medium text-green-600">Normal</span>
+                    <span className="text-gray-600 flex items-center gap-2"><div className={`h-1.5 w-1.5 rounded-full ${ampTone.dot}`}></div> Signal amplitude</span>
+                    <span className={`font-medium ${ampTone.text}`}>{metrics ? metrics.amplitudeQuality.label : 'Checking...'}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-gray-600">• Noise level</span>
-                    <span className="font-medium text-green-600">Low</span>
+                    <span className="text-gray-600 flex items-center gap-2"><div className={`h-1.5 w-1.5 rounded-full ${noiseTone.dot}`}></div> Noise level</span>
+                    <span className={`font-medium ${noiseTone.text}`}>{metrics ? metrics.noiseQuality.label : 'Checking...'}</span>
                   </div>
                   <div className="flex justify-between pt-2 border-t border-gray-100">
                     <span className="text-gray-600 text-xs uppercase font-bold">Baseline</span>
-                    <span className="text-xs font-medium text-gray-500">
-                      {recordingState === 'idle' ? 'unknown' : recordingState === 'recording' ? 'recording...' : 'Stable'}
+                    <span className={`text-xs font-medium ${
+                      recordingState !== 'done' ? 'text-gray-500'
+                      : baseline?.stable === true ? 'text-green-600'
+                      : baseline?.stable === false ? 'text-red-600'
+                      : 'text-gray-500'}`}>
+                      {recordingState === 'idle' ? 'unknown'
+                        : recordingState === 'recording' ? 'recording...'
+                        : baseline?.stable === true ? 'Stable'
+                        : baseline?.stable === false ? 'Unstable'
+                        : 'Recorded'}
                     </span>
                   </div>
                 </div>
@@ -325,10 +551,25 @@ export default function EEGCalibrationFlow({ onFinish }: { onFinish: () => void 
                  </ul>
               </div>
 
-              {/* FINISH BUTTON */}
+              {recordingState === 'done' && baseline?.stable === false && (
+                <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 animate-in fade-in duration-300">
+                  <AlertCircle className="h-5 w-5 shrink-0 text-red-600" />
+                  <span>
+                    Baseline looks unstable{baseline.reason ? ` (${baseline.reason})` : ''}. Keep still
+                    and press <span className="font-medium">Record Again</span> for a cleaner baseline.
+                  </span>
+                </div>
+              )}
+
               {recordingState === 'done' && (
-                <div className="flex justify-end pt-4 animate-in fade-in zoom-in-95 duration-300">
-                  <button 
+                <div className="flex gap-3 justify-end pt-4 animate-in fade-in zoom-in-95 duration-300">
+                  <button
+                    onClick={handleExport}
+                    className="rounded-lg border border-gray-300 px-6 py-3 text-sm font-medium text-gray-700 transition-all hover:bg-gray-50"
+                  >
+                    Export Baseline Recording
+                  </button>
+                  <button
                     onClick={onFinish}
                     className="rounded-lg bg-black px-8 py-3 text-sm font-medium text-white transition-all hover:bg-gray-800"
                   >
