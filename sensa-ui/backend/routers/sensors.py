@@ -4,7 +4,7 @@ router = APIRouter(prefix="/api")
 
 # --- Tobii Pro SDK (research-grade trackers) --------------------------------
 try:
-    import tobii_research as tr
+    import tobii_research as tr # type: ignore
     TOBII_PRO_AVAILABLE = True
 except ImportError:
     TOBII_PRO_AVAILABLE = False
